@@ -1,0 +1,164 @@
+diff --git a/talk/media/base/videocapturer.cc b/talk/media/base/videocapturer.cc
+index 653e793..af00cba 100644
+--- a/talk/media/base/videocapturer.cc
++++ b/talk/media/base/videocapturer.cc
+@@ -85,7 +85,8 @@ CapturedFrame::CapturedFrame()
+       time_stamp(0),
+       data_size(0),
+       rotation(0),
+-      data(NULL) {}
++      data(NULL),
++      nativeHandle(NULL) {}
+ 
+ // TODO(fbarchard): Remove this function once lmimediaengine stops using it.
+ bool CapturedFrame::GetDataSize(uint32* size) const {
+diff --git a/talk/media/base/videocapturer.h b/talk/media/base/videocapturer.h
+index ebd8d4a..5ae7073 100644
+--- a/talk/media/base/videocapturer.h
++++ b/talk/media/base/videocapturer.h
+@@ -104,6 +104,8 @@ struct CapturedFrame {
+ 
+   void*  data;          // pointer to the frame data. This object allocates the
+                         // memory or points to an existing memory.
++  void*  nativeHandle;  // pointer to a native texture handle.
++
+ 
+  private:
+   DISALLOW_COPY_AND_ASSIGN(CapturedFrame);
+diff --git a/talk/media/webrtc/webrtcvideoframefactory.cc b/talk/media/webrtc/webrtcvideoframefactory.cc
+index b0c8d16..9a36189 100755
+--- a/talk/media/webrtc/webrtcvideoframefactory.cc
++++ b/talk/media/webrtc/webrtcvideoframefactory.cc
+@@ -25,9 +25,10 @@
+  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+-#include "talk/media/webrtc/webrtcvideoframe.h"
+ #include "talk/media/webrtc/webrtcvideoframefactory.h"
+ #include "webrtc/base/logging.h"
++#include "libyuv/convert.h"
++#include "talk/media/base/videocapturer.h"
+ 
+ namespace cricket {
+ 
+@@ -42,4 +43,83 @@ VideoFrame* WebRtcVideoFrameFactory::CreateAliasedFrame(
+   return frame.release();
+ }
+ 
++WebRtcPooledVideoFrameFactory::~WebRtcPooledVideoFrameFactory() {
++  buffer_pool_.Release();
++}
++
++VideoFrame* WebRtcPooledVideoFrameFactory::CreateAliasedFrame(
++                                                              const CapturedFrame* aliased_frame,
++                                                              int width,
++                                                              int height) const {
++
++  VideoFrame *frame = nullptr;
++
++  if (aliased_frame->nativeHandle) {
++    CMSampleBufferRef sampleBuffer = (CMSampleBufferRef)aliased_frame->nativeHandle;
++    frame = this->CreateAliasedSampleBuffer(sampleBuffer);
++  }
++  else {
++    LOG(LS_ERROR) << "Failed to create WebRtcVideoFrame in CreateAliasedFrame.";
++  }
++
++  return frame;
++}
++
++WebRtcVideoFrame* WebRtcPooledVideoFrameFactory::CreateAliasedSampleBuffer(CMSampleBufferRef incomingBuffer) const
++{
++  CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(incomingBuffer);
++
++  int width = CVPixelBufferGetWidth(pixelBuffer);
++  int height = CVPixelBufferGetHeight(pixelBuffer);
++
++  rtc::scoped_refptr<webrtc::VideoFrameBuffer> poolBuffer = buffer_pool_.CreateBuffer(width, height);
++  rtc::scoped_ptr<WebRtcVideoFrame> poolFrame(new WebRtcVideoFrame(poolBuffer,
++                                                                   rtc::TimeNanos(),
++                                                                   0,
++                                                                   webrtc::kVideoRotation_0));
++
++  // We have a buffer from the pool, fill it converting from the incoming buffer.
++
++  CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
++
++  const int kYPlaneIndex = 0;
++  const int kUVPlaneIndex = 1;
++
++  const uint8_t *baseAddress = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, kYPlaneIndex);
++  size_t yPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, kYPlaneIndex);
++  size_t uvPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, kUVPlaneIndex);
++  size_t uvPlaneHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, kUVPlaneIndex);
++  CMSampleTimingInfo info;
++  CMSampleBufferGetSampleTimingInfo(incomingBuffer, 0, &info);
++  int64 timestamp = CMTimeGetSeconds(info.presentationTimeStamp) * rtc::kNumNanosecsPerSec;
++
++  // Format Conversion
++
++  const uint8_t *uvAddress = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, kUVPlaneIndex);
++  size_t chromaWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, kUVPlaneIndex);
++  size_t ySize = (size_t)(width * height);
++  size_t uSize = (size_t)(chromaWidth * uvPlaneHeight);
++
++  const webrtc::VideoFrameBuffer *poolBufferPtr = poolBuffer.get();
++
++  uint8 *yBuffer = (uint8 *)poolBufferPtr->data(webrtc::kYPlane);
++  uint8 *uBuffer = (uint8 *)poolBufferPtr->data(webrtc::kUPlane);
++  uint8 *vBuffer = (uint8 *)poolBufferPtr->data(webrtc::kVPlane);
++
++  int yStride = poolBuffer->stride(webrtc::kYPlane);
++  int uStride = poolBuffer->stride(webrtc::kUPlane);
++  int vStride = poolBuffer->stride(webrtc::kVPlane);
++
++  libyuv::NV12ToI420(baseAddress, (int)yPlaneBytesPerRow,
++                     uvAddress, (int)uvPlaneBytesPerRow,
++                     yBuffer, yStride,
++                     uBuffer, uStride,
++                     vBuffer, vStride,
++                     width, height);
++
++  CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
++
++  return poolFrame.release();
++}
++
+ }  // namespace cricket
+diff --git a/talk/media/webrtc/webrtcvideoframefactory.h b/talk/media/webrtc/webrtcvideoframefactory.h
+index 5557a35..ce9990d 100644
+--- a/talk/media/webrtc/webrtcvideoframefactory.h
++++ b/talk/media/webrtc/webrtcvideoframefactory.h
+@@ -29,6 +29,11 @@
+ #define TALK_MEDIA_WEBRTC_WEBRTCVIDEOFRAMEFACTORY_H_
+ 
+ #include "talk/media/base/videoframefactory.h"
++#include "webrtc/common_video/interface/i420_buffer_pool.h"
++#include "talk/media/webrtc/webrtcvideoframe.h"
++
++#import <CoreVideo/CoreVideo.h>
++#import <CoreMedia/CoreMedia.h>
+ 
+ namespace cricket {
+ 
+@@ -42,6 +47,20 @@ class WebRtcVideoFrameFactory : public VideoFrameFactory {
+                                  int height) const override;
+ };
+ 
++class WebRtcPooledVideoFrameFactory : public VideoFrameFactory {
++  public:
++   VideoFrame* CreateAliasedFrame(const CapturedFrame* aliased_frame,
++                                 int width,
++                                 int height) const override;
++protected:
++  virtual ~WebRtcPooledVideoFrameFactory();
++private:
++
++  WebRtcVideoFrame* CreateAliasedSampleBuffer(CMSampleBufferRef sampleBuffer) const;
++
++  mutable webrtc::I420BufferPool buffer_pool_;
++};
++
+ }  // namespace cricket
+ 
+ #endif  // TALK_MEDIA_WEBRTC_WEBRTCVIDEOFRAMEFACTORY_H_

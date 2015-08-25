@@ -1,0 +1,13 @@
+diff --git a/webrtc/build/common.gypi b/webrtc/build/common.gypi
+index 9335d35..e5205b0 100644
+--- a/webrtc/build/common.gypi
++++ b/webrtc/build/common.gypi
+@@ -126,7 +126,7 @@
+ 
+     # Enable this to use HW H.264 encoder/decoder on iOS/Mac PeerConnections.
+     # Enabling this may break interop with Android clients that support H264.
+-    'use_objc_h264%': 0,
++    'use_objc_h264%': 1,
+ 
+     'conditions': [
+       ['build_with_chromium==1', {
